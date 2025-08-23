@@ -17,7 +17,7 @@ def load_companies(path="data/companies.csv"):
         df = pd.read_csv(path)
     else:
         # try common Excel names
-        for x in ["data/companies.xlsx", "data/companies10.xlsx"]:
+        for x in ["data/companies10.xlsx"]:
             if os.path.exists(x):
                 df = pd.read_excel(x)
                 break
