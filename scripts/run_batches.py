@@ -10,11 +10,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
+import httpx
+from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
+
 from openai import OpenAI
+from openai import APIConnectionError  # for precise retry targeting
 
 # ====== Config ======
-MODEL = os.getenv("RESP_MODEL", "gpt-5")   # set in workflow env
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
+MODEL = os.getenv("RESP_MODEL", "gpt-5")           # set in workflow env
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))    # keep modest to reduce rework on failure
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "90.0"))  # seconds
+SDK_MAX_RETRIES = int(os.getenv("SDK_MAX_RETRIES", "2"))       # SDK-level retries (short)
+
 OUTDIR = pathlib.Path("build")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -32,18 +39,16 @@ def _find_excel() -> str:
     for p in ("data/companies.xlsx", "data/companies10.xlsx"):
         if os.path.exists(p):
             return p
-    raise FileNotFoundError(
-        "Expected data/companies.xlsx (or data/companies10.xlsx)."
-    )
+    raise FileNotFoundError("Expected data/companies.xlsx (or data/companies10.xlsx).")
 
 
 def _clean_bse_code(v) -> str:
-    """Return a string code like '543693' from values such as 543693, '543693', '543693.0'."""
+    """Return '543693' from values such as 543693, '543693', or '543693.0'."""
     if pd.isna(v):
         return ""
     s = str(v).strip()
     try:
-        return str(int(float(s)))  # handles '543693.0'
+        return str(int(float(s)))
     except Exception:
         return s
 
@@ -82,12 +87,35 @@ def chunk(lst: List[Dict[str, str]], size: int):
         yield (i // size) + 1, lst[i:i + size]
 
 
-# ---------- LLM call: Responses API (web_search only, JSON text) ----------
+# ---------- LLM call with robust retry ----------
+# Cookbook recommends exponential backoff for transient errors. :contentReference[oaicite:1]{index=1}
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),                              # up to 5 attempts
+    wait=wait_random_exponential(multiplier=1, max=20),     # 1s → ~20s backoff with jitter
+    retry=retry_if_exception_type((
+        APIConnectionError,          # OpenAI SDK network error
+        httpx.ReadTimeout,           # transport timeout
+        httpx.RemoteProtocolError,   # "Server disconnected without sending a response"
+        httpx.ConnectError,
+        httpx.NetworkError,
+    ))
+)
+def _responses_create_with_retry(client: OpenAI, *, model: str, tools: list, input: list):
+    return client.responses.create(
+        model=model,
+        tools=tools,
+        input=input,
+    )
+
+
 def call_web_only_json(client: OpenAI, group: List[Dict[str, str]]) -> Dict[str, Any]:
     prompt = open("prompts/PROMPT.md", "r", encoding="utf-8").read()
     payload = {"companies": group, "want_quarters": "all"}
 
-    resp = client.responses.create(
+    # One call per batch, retried on transient network failures
+    resp = _responses_create_with_retry(
+        client,
         model=MODEL,
         tools=[{"type": "web_search"}],
         input=[
@@ -101,7 +129,7 @@ def call_web_only_json(client: OpenAI, group: List[Dict[str, str]]) -> Dict[str,
         return json.loads(text)
     except Exception as e:
         print("WARN: JSON parse failed:", e)
-        print("RAW TEXT:", text[:2000])
+        print("RAW TEXT (first 2k):", text[:2000])
         return {"companies": []}
 
 
@@ -111,7 +139,6 @@ def tidy_to_frames(collected: List[Dict[str, Any]]):
     for c in collected:
         name = c.get("name", "")
         if not c.get("resolved", False):
-            # unresolved companies are excluded from charts
             continue
         for row in (c.get("quarters") or []):
             q_rows.append({
@@ -162,8 +189,7 @@ def plot_company(pdf: PdfPages, name: str, qdf: pd.DataFrame, sdf: pd.DataFrame)
                 plt.plot(sub["quarter"], sub[col], label=col.replace("_", " ").title())
         plt.title(f"{name} — Shareholding %")
         plt.xticks(rotation=45, ha="right")
-        plt.xlabel("Quarter")
-        plt.ylabel("%")
+        plt.xlabel("Quarter"); plt.ylabel("%")
         plt.legend()
         plt.tight_layout()
     pdf.savefig(); plt.close()
@@ -171,17 +197,24 @@ def plot_company(pdf: PdfPages, name: str, qdf: pd.DataFrame, sdf: pd.DataFrame)
 
 # ---------- main ----------
 def main():
-    client = OpenAI()  # uses OPENAI_API_KEY
+    # Increase SDK-level timeout & short internal retries to reduce spurious failures. :contentReference[oaicite:2]{index=2}
+    client = OpenAI(timeout=REQUEST_TIMEOUT, max_retries=SDK_MAX_RETRIES)
+
     companies = load_companies_xlsx()
 
     all_companies_payload: List[Dict[str, Any]] = []
     for bid, group in chunk(companies, BATCH_SIZE):
         print(f"-- Batch {bid} ({len(group)} companies) --")
-        data = call_web_only_json(client, group)
+        try:
+            data = call_web_only_json(client, group)
+        except Exception as e:
+            # After all retry attempts, fail *softly* for this batch so you don't burn more tokens.
+            print(f"ERROR: batch {bid} failed after retries: {e}")
+            data = {"companies": []}
         batch_list = data.get("companies", [])
         print(f"   received {len(batch_list)} company payloads")
         all_companies_payload.extend(batch_list)
-        time.sleep(1)
+        time.sleep(1)  # gentle pacing
 
     # Tidy → DataFrames
     qdf, sdf = tidy_to_frames(all_companies_payload)
@@ -195,16 +228,14 @@ def main():
     # Multi-page PDF
     out_pdf = OUTDIR / "AllCompanies_Report.pdf"
     with PdfPages(out_pdf) as pdf:
-        # robust list of company names even if one DF is empty
         names_q = qdf["company"] if "company" in qdf else pd.Series(dtype=str)
         names_s = sdf["company"] if "company" in sdf else pd.Series(dtype=str)
         companies_for_pdf = sorted(set(pd.concat([names_q, names_s], ignore_index=True).dropna()))
 
         if not companies_for_pdf:
-            # write a one-page PDF with a notice so the file always exists
             plt.figure(figsize=(8, 4))
             plt.axis("off")
-            plt.text(0.5, 0.5, "No data returned from Screener", ha="center", va="center", fontsize=12)
+            plt.text(0.5, 0.5, "No data returned (network or source issue).", ha="center", va="center", fontsize=12)
             pdf.savefig(); plt.close()
         else:
             for name in companies_for_pdf:
