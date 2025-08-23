@@ -43,7 +43,7 @@ jobs:
       - name: Run prompt (all companies at once)
         run: |
           python scripts/run_batches.py
-        # scripts/run_all.py sends ONE Responses API request with web_search + code_interpreter
+        # scripts/run_batches.py sends ONE Responses API request with web_search + code_interpreter
         # and downloads the generated PDF/CSV into build/.
 
       - name: List build outputs (debug)
