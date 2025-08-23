@@ -60,7 +60,7 @@ def call_llm_for_batch(client: OpenAI, batch_id: int, companies: List[Dict]):
 
     resp = client.responses.create(
         model=MODEL,
-        tools=[{"type": "web_search"}, {"type": "code_interpreter"}],
+        tools=[{"type": "web_search"},{"type": "code_interpreter", "container": {"type": "auto"}}],
         input=[
             {"role": "system", "content": open("prompts/PROMPT.md", "r", encoding="utf-8").read()},
             {"role": "user", "content": json.dumps(user_payload)},
