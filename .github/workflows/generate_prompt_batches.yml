@@ -1,5 +1,4 @@
 name: Screener Prompt (web_search → JSON → local charts)
-
 on:
   workflow_dispatch:
     inputs:
