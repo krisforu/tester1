@@ -1,0 +1,8 @@
+on:
+  workflow_dispatch:
+    inputs:
+      TEST_LIMIT:
+        description: "Trim companies.xlsx to first N rows"
+        required: false
+        default: "0"
+        type: number
