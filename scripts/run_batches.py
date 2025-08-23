@@ -1,35 +1,53 @@
 # scripts/run_batches.py
 import os
 import json
+import time
 import pathlib
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import pandas as pd
 from openai import OpenAI
 
-MODEL = "gpt-4o"  # Responses API model
+# ====== Configuration ======
+MODEL = os.getenv("RESP_MODEL", "gpt-5")   # use GPT-5
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
 OUTDIR = pathlib.Path("build")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 
+def _col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
+    low = {str(c).strip().lower(): c for c in df.columns}
+    for n in names:
+        if n.lower() in low:
+            return low[n.lower()]
+    return None
+
+
 def load_companies(path_xlsx: str = "data/companies.xlsx") -> List[Dict]:
-    # locate your Excel file (supports companies10.xlsx too)
-    xpaths = [path_xlsx, "data/companies10.xlsx"]
+    """
+    Read your wide Excel with many columns and return dicts:
+      {name, nse_symbol, bse_symbol, bse_code}
+    We do NOT decide the URL here; the prompt will try Company → NSE → BSE symbol → BSE code.
+    """
+    xpaths = [path_xlsx, "data/companies10.xlsx", "data/companies.xlsm"]
     xfile = next((p for p in xpaths if os.path.exists(p)), None)
     if not xfile:
-        raise FileNotFoundError("Expected data/companies.xlsx (or data/companies10.xlsx)")
+        raise FileNotFoundError("Expected data/companies.xlsx (or companies10.xlsx)")
 
-    # read Excel via openpyxl
-    df = pd.read_excel(xfile, engine="openpyxl")  # pandas read_excel uses openpyxl for .xlsx :contentReference[oaicite:0]{index=0}
+    df = pd.read_excel(xfile)  # requires openpyxl
     df.columns = [str(c).strip() for c in df.columns]
 
-    required = ["Company", "BSE_Code"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in {xfile}: {missing}. Need at least Company and BSE_Code.")
+    name_c = _col(df, ["Company", "Name", "Company Name"])
+    nse_c  = _col(df, ["NSE_Symbol", "NSE", "NSE Ticker", "NSE Symbol"])
+    bse_s  = _col(df, ["BSE_Symbol", "BSE", "BSE Ticker", "BSE Symbol"])
+    bse_c  = _col(df, ["BSE_Code", "BSE Code", "Code", "BSEcode", "BSEID"])
 
-    def to_code(v):
-        if pd.isna(v): return ""
+    if not name_c:
+        raise ValueError("Excel must contain a company name column (e.g., 'Company').")
+
+    def clean_bse_code(v):
+        if pd.isna(v):
+            return ""
         try:
             return str(int(v))  # avoid '543693.0'
         except Exception:
@@ -37,158 +55,108 @@ def load_companies(path_xlsx: str = "data/companies.xlsx") -> List[Dict]:
 
     rows: List[Dict] = []
     for _, r in df.iterrows():
-        name = str(r["Company"]).strip()
-        bse_code = to_code(r["BSE_Code"])
-        bse_sym  = str(r.get("BSE_Symbol", "")).strip()
-        nse_sym  = str(r.get("NSE_Symbol", "")).replace(".NS", "").strip()
-
-        # Prefer numeric BSE code (works reliably on Screener),
-        # else fall back to NSE symbol (without .NS), then BSE symbol.
-        slug_or_code = bse_code or nse_sym or bse_sym
-        rows.append({"name": name, "slug_or_code": slug_or_code})
-
+        rows.append({
+            "name": str(r[name_c]).strip(),
+            "nse_symbol": ("" if not nse_c or pd.isna(r.get(nse_c)) else str(r[nse_c]).strip()),
+            "bse_symbol": ("" if not bse_s or pd.isna(r.get(bse_s)) else str(r[bse_s]).strip()),
+            "bse_code": clean_bse_code(r[bse_c]) if bse_c else ""
+        })
     return rows
 
-def call_llm_for_batch(client: OpenAI, batch_id: int, companies: List[Dict]):
+
+def chunk(lst: List[Dict], size: int):
+    for i in range(0, len(lst), size):
+        yield (i // size) + 1, lst[i:i + size]
+
+
+def call_batch(client: OpenAI, batch_id: int, companies: List[Dict]) -> List[pathlib.Path]:
+    payload = {
+        "companies": companies,
+        "out_pdf": f"Report_batch_{batch_id:02d}.pdf",
+        "out_csv": f"Quarterly_batch_{batch_id:02d}.csv",
+    }
+
+    resp = client.responses.create(
+        model=MODEL,
+        tools=[
+            {"type": "web_search"},
+            {"type": "code_interpreter", "container": {"type": "auto"}}
+        ],
+        input=[
+            {
+                "role": "system",
+                "content": open("prompts/PROMPT.md", "r", encoding="utf-8").read()
+            },
+            {
+                "role": "user",
+                "content": json.dumps(payload)
+            }
+        ],
+    )
+
+    # Debug (helps when no files are returned)
+    print("DEBUG text:\n", getattr(resp, "output_text", ""))
+    saved: List[pathlib.Path] = []
+
+    for item in (resp.output or []):
+        for c in getattr(item, "content", []) or []:
+            if getattr(c, "type", "") == "output_file" and getattr(c, "file_id", None):
+                fmeta = client.files.retrieve(c.file_id)
+                out_path = OUTDIR / (fmeta.filename or c.file_id)
+                with client.files.with_streaming_response.download(c.file_id) as s:
+                    s.stream_to_file(out_path)
+                print("saved:", out_path)
+                saved.append(out_path)
+    return saved
+
+
+def merge_csvs_to_one(out_csv="build/AllCompanies_Quarterly.csv"):
+    dfs = []
+    for p in sorted(OUTDIR.glob("Quarterly_batch_*.csv")):
+        try:
+            dfs.append(pd.read_csv(p))
+        except Exception as e:
+            print("WARN: skip CSV", p, e)
+    if dfs:
+        big = pd.concat(dfs, ignore_index=True)
+        big.to_csv(out_csv, index=False, encoding="utf-8")
+        print("✓ merged CSV ->", out_csv)
+
+
+def merge_pdfs_to_one(out_pdf="build/AllCompanies_Report.pdf"):
     try:
-        # We still call it "batch" for compatibility, but we pass ALL companies
-        user_payload = {
-            "batch_id": batch_id,
-            "companies": companies,
-            "out_pdf": "AllCompanies_Report.pdf",
-            "out_csv": "AllCompanies_Quarterly.csv",
-        }
-        
-        print(f"Making Responses API call with model: {MODEL}")
-        print(f"User payload: {len(companies)} companies")
-
-        resp = client.responses.create(
-            model=MODEL,
-            tools=[{"type": "web_search"},{"type": "code_interpreter", "container": {"type": "auto"}}],
-            input=[
-                {"role": "system", "content": open("prompts/PROMPT.md", "r", encoding="utf-8").read()},
-                {"role": "user", "content": json.dumps(user_payload)},
-            ],
-        )
-
-        print(f"Response received. Processing output files...")
-        print(f"Response type: {type(resp)}")
-        print(f"Response output: {resp.output}")
-        
-        # Download files produced by Code Interpreter
-        saved = []
-        output_items = resp.output or []
-        print(f"Number of output items: {len(output_items)}")
-        
-        for i, item in enumerate(output_items):
-            print(f"Item {i}: type={type(item)}, content={getattr(item, 'content', 'NO_CONTENT')}")
-            for j, c in enumerate(getattr(item, "content", []) or []):
-                print(f"  Content {j}: type={getattr(c, 'type', 'NO_TYPE')}, file_id={getattr(c, 'file_id', 'NO_FILE_ID')}")
-                if getattr(c, "type", "") == "output_file" and getattr(c, "file_id", None):
-                    try:
-                        fmeta = client.files.retrieve(c.file_id)
-                        fname = fmeta.filename or f"batch_{batch_id}_{c.file_id}"
-                        out_path = OUTDIR / fname
-                        print(f"Downloading file: {fname} -> {out_path}")
-                        with client.files.with_streaming_response.download(c.file_id) as stream:
-                            stream.stream_to_file(out_path)
-                        saved.append(out_path)
-                        print(f"✓ Saved: {out_path} ({out_path.stat().st_size} bytes)")
-                    except Exception as e:
-                        print(f"Error downloading file {c.file_id}: {e}")
-        
-        if not saved:
-            print("Warning: No files were generated by the LLM")
-            print("Creating fallback empty files to prevent workflow failure...")
-            
-            # Create empty fallback files to prevent workflow failure
-            fallback_pdf = OUTDIR / "AllCompanies_Report.pdf"
-            fallback_csv = OUTDIR / "AllCompanies_Quarterly.csv"
-            
-            # Create minimal PDF
-            try:
-                from reportlab.platypus import SimpleDocTemplate, Paragraph
-                from reportlab.lib.pagesizes import A4
-                from reportlab.lib.styles import getSampleStyleSheet
-                
-                styles = getSampleStyleSheet()
-                story = [Paragraph("No data generated - LLM did not produce output files", styles["Normal"])]
-                doc = SimpleDocTemplate(str(fallback_pdf), pagesize=A4)
-                doc.build(story)
-                saved.append(fallback_pdf)
-                print(f"✓ Created fallback PDF: {fallback_pdf}")
-            except Exception as e:
-                print(f"Could not create fallback PDF: {e}")
-            
-            # Create minimal CSV
-            try:
-                fallback_csv.write_text("Company,Quarter,Sales,NetProfit,Promoter,DII,Public\nNo data,N/A,N/A,N/A,N/A,N/A,N/A\n")
-                saved.append(fallback_csv)
-                print(f"✓ Created fallback CSV: {fallback_csv}")
-            except Exception as e:
-                print(f"Could not create fallback CSV: {e}")
-            
-        return saved
-        
+        from PyPDF2 import PdfMerger
+        merger = PdfMerger()
+        any_input = False
+        for p in sorted(OUTDIR.glob("Report_batch_*.pdf")):
+            merger.append(str(p))
+            any_input = True
+        if any_input:
+            with open(out_pdf, "wb") as f:
+                merger.write(f)
+            merger.close()
+            print("✓ merged PDF ->", out_pdf)
     except Exception as e:
-        print(f"Error in call_llm_for_batch: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+        print("WARN: PDF merge skipped:", e)
 
 
 def main():
-    try:
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise ValueError("OPENAI_API_KEY environment variable is required")
-        
-        client = OpenAI()  # needs OPENAI_API_KEY
-        print(f"Loading companies...")
-        companies = load_companies()
-        print(f"Found {len(companies)} companies")
-        
-        print(f"Calling LLM for batch processing...")
-        saved = call_llm_for_batch(client, 1, companies)
-        print("[all] saved:", [str(p) for p in saved])
+    client = OpenAI()  # uses OPENAI_API_KEY env
+    companies = load_companies()
 
-        print("\nArtifacts in build/:")
-        for p in sorted(OUTDIR.glob("*")):
-            print(" -", p)
-            
-        # Verify expected files exist
-        expected_files = ["AllCompanies_Report.pdf", "AllCompanies_Quarterly.csv"]
-        for fname in expected_files:
-            fpath = OUTDIR / fname
-            if fpath.exists():
-                print(f"✓ {fname} created successfully ({fpath.stat().st_size} bytes)")
-            else:
-                print(f"✗ {fname} NOT FOUND - creating empty placeholder")
-                # Create empty placeholder files to prevent workflow failure
-                if fname.endswith('.pdf'):
-                    try:
-                        from reportlab.platypus import SimpleDocTemplate, Paragraph
-                        from reportlab.lib.pagesizes import A4
-                        from reportlab.lib.styles import getSampleStyleSheet
-                        
-                        styles = getSampleStyleSheet()
-                        story = [Paragraph(f"Placeholder file - {fname} was not generated by the LLM", styles["Normal"])]
-                        doc = SimpleDocTemplate(str(fpath), pagesize=A4)
-                        doc.build(story)
-                        print(f"✓ Created placeholder PDF: {fpath}")
-                    except Exception as e:
-                        print(f"Could not create placeholder PDF: {e}")
-                elif fname.endswith('.csv'):
-                    try:
-                        fpath.write_text("Company,Quarter,Sales,NetProfit,Promoter,DII,Public\nPlaceholder,N/A,N/A,N/A,N/A,N/A,N/A\n")
-                        print(f"✓ Created placeholder CSV: {fpath}")
-                    except Exception as e:
-                        print(f"Could not create placeholder CSV: {e}")
-                
-    except Exception as e:
-        print(f"Error in main(): {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+    # Run in batches to avoid container timeouts; tweak BATCH_SIZE via env
+    for bid, group in chunk(companies, BATCH_SIZE):
+        print(f"== Batch {bid} ({len(group)} companies) ==")
+        call_batch(client, bid, group)
+        time.sleep(2)  # polite pacing
+
+    # Merge all batches into one CSV + one PDF
+    merge_csvs_to_one()
+    merge_pdfs_to_one()
+
+    print("\nArtifacts in build/:")
+    for p in sorted(OUTDIR.glob("*")):
+        print(" -", p)
 
 
 if __name__ == "__main__":
