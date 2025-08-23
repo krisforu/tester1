@@ -108,40 +108,83 @@ def _extract_json(text: str) -> Dict[str, Any]:
             pass
     return {"companies": []}
 
+MAX_LLM_RETRIES = int(os.getenv("MAX_LLM_RETRIES", "3"))
+RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "2.0"))
+USE_WEB_SEARCH = os.getenv("USE_WEB_SEARCH", "1") not in ("0","false","False")
+
 def call_web_only_json(client: OpenAI, batch_id: int, group: List[Dict[str, str]]) -> Dict[str, Any]:
     prompt = _json_hard_prompt(group)
-    try:
-        resp = client.responses.create(
-            model=MODEL,
-            # web_search helps; if your plan blocks it, the model will still answer from knowledge.
-            tools=[{"type": "web_search"}],
-            input=[{"role": "user", "content": prompt}],
-        )
-    except APIStatusError as e:
-        msg = getattr(e, "message", "") or str(e)
-        err = getattr(e, "body", {}) or {}
-        if "insufficient_quota" in msg or err.get("type") == "insufficient_quota" or err.get("code") == "insufficient_quota":
-            raise RuntimeError("INSUFFICIENT_QUOTA") from e
-        print("API error (non-quota):", msg)
-        return {"companies": []}
-    except Exception as e:
-        print("LLM call failed:", e)
-        return {"companies": []}
 
-    text = getattr(resp, "output_text", "") or ""
-    # Save raw reply for cheap debugging
-    raw_path = OUTDIR / f"raw_batch_{batch_id:02d}.txt"
-    try:
-        raw_path.write_text(text, encoding="utf-8")
-    except Exception:
-        pass
+    last_err = None
+    for attempt in range(MAX_LLM_RETRIES + 1):
+        try:
+            resp = client.responses.create(
+                model=MODEL,
+                tools=([{"type": "web_search"}] if USE_WEB_SEARCH else []),
+                input=[{"role": "user", "content": prompt}],
+            )
 
-    obj = _extract_json(text)
-    # Sanity: must have "companies" list
-    if not isinstance(obj, dict) or not isinstance(obj.get("companies"), list):
-        return {"companies": []}
-    return obj
+            # Save full structured response for inspection
+            try:
+                (OUTDIR / f"resp_batch_{batch_id:02d}.json").write_text(
+                    resp.model_dump_json(indent=2), encoding="utf-8"
+                )
+            except Exception:
+                pass
 
+            # Extract text robustly
+            text = _extract_text_from_responses(resp)
+
+            # Save raw text
+            try:
+                (OUTDIR / f"raw_batch_{batch_id:02d}.txt").write_text(text, encoding="utf-8")
+            except Exception:
+                pass
+
+            obj = _extract_json(text)
+            if isinstance(obj, dict) and isinstance(obj.get("companies"), list):
+                return obj
+            # If weird content, return empty but stop further retries (this is not transient)
+            return {"companies": []}
+
+        except APIStatusError as e:
+            # quota/rate-limit/5xx handling
+            msg = getattr(e, "message", "") or str(e)
+            body = getattr(e, "body", {}) or {}
+            code = body.get("code")
+            typ  = body.get("type")
+
+            if code == "insufficient_quota" or typ == "insufficient_quota" or "insufficient_quota" in msg:
+                # Stop immediately to avoid charges
+                raise RuntimeError("INSUFFICIENT_QUOTA") from e
+
+            # Rate limit or 5xx? backoff and retry
+            if isinstance(e, RateLimitError) or "rate_limit" in msg or e.status_code in (429, 500, 502, 503, 504):
+                last_err = e
+            else:
+                # non-transient API error
+                print("API error (non-transient):", msg)
+                return {"companies": []}
+
+        except (APIConnectionError, TimeoutError) as e:
+            # transient network/timeout
+            last_err = e
+
+        except Exception as e:
+            # anything else: log once and return empty
+            print("LLM call failed:", e)
+            return {"companies": []}
+
+        # Backoff before next retry
+        if attempt < MAX_LLM_RETRIES:
+            delay = RETRY_BACKOFF_BASE ** attempt
+            print(f"Retrying LLM call in {delay:.1f}s (attempt {attempt+1}/{MAX_LLM_RETRIES})…")
+            time.sleep(delay)
+
+    # If we get here, all retries failed
+    if last_err:
+        print("LLM call failed after retries:", last_err)
+    return {"companies": []}
 # ---------- Tidy / plotting / I/O ----------
 def tidy_to_frames(collected: List[Dict[str, Any]]):
     q_rows, s_rows = [], []
