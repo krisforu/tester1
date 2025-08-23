@@ -7,3 +7,4 @@ tenacity>=8.5.0
 openpyxl>=3.1.5
 pandas[html]>=2.2.2   # installs BeautifulSoup4 + (html5lib or lxml)
 PyPDF2>=3.0.1
+pypdf
