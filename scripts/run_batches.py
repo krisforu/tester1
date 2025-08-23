@@ -11,10 +11,10 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type, retry_if_exception
 
 from openai import OpenAI
-from openai import APIConnectionError  # for precise retry targeting
+from openai import APIConnectionError, APIStatusError, RateLimitError
 
 # ====== Config ======
 MODEL = os.getenv("RESP_MODEL", "gpt-5")           # set in workflow env
