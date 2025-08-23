@@ -9,16 +9,28 @@ MODEL = "o4-mini"          # or another Responses API model you prefer
 OUTDIR = pathlib.Path("build")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
+import os
+import pandas as pd
+
 def load_companies(path="data/companies.csv"):
-    df = pd.read_csv(path)
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+    else:
+        # try common Excel names
+        for x in ["data/companies.xlsx", "data/companies10.xlsx"]:
+            if os.path.exists(x):
+                df = pd.read_excel(x)
+                break
+        else:
+            raise FileNotFoundError(
+                "Provide data/companies.csv or data/companies.xlsx (with columns: name, screener_slug, bse_code)"
+            )
+
     rows = []
     for _, r in df.iterrows():
-        slug = (str(r.get("screener_slug")) if not pd.isna(r.get("screener_slug")) else "").strip()
-        code = (str(r.get("bse_code")) if not pd.isna(r.get("bse_code")) else "").strip()
-        rows.append({
-            "name": r["name"],
-            "slug_or_code": slug or code,   # prefer slug if you have it
-        })
+        slug = ("" if pd.isna(r.get("screener_slug")) else str(r.get("screener_slug")).strip())
+        code = ("" if pd.isna(r.get("bse_code")) else str(r.get("bse_code")).strip())
+        rows.append({"name": r["name"], "slug_or_code": slug or code})
     return rows
 
 def chunker(seq, size):
