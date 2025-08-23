@@ -11,15 +11,42 @@ OUTDIR = pathlib.Path("build")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_companies(path: str = "data/companies.csv") -> List[Dict]:
-    df = pd.read_csv(path)
+def load_companies(path_xlsx: str = "data/companies.xlsx") -> List[Dict]:
+    # locate your Excel file (supports companies10.xlsx too)
+    xpaths = [path_xlsx, "data/companies10.xlsx"]
+    xfile = next((p for p in xpaths if os.path.exists(p)), None)
+    if not xfile:
+        raise FileNotFoundError("Expected data/companies.xlsx (or data/companies10.xlsx)")
+
+    # read Excel via openpyxl
+    df = pd.read_excel(xfile, engine="openpyxl")  # pandas read_excel uses openpyxl for .xlsx :contentReference[oaicite:0]{index=0}
+    df.columns = [str(c).strip() for c in df.columns]
+
+    required = ["Company", "BSE_Code"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in {xfile}: {missing}. Need at least Company and BSE_Code.")
+
+    def to_code(v):
+        if pd.isna(v): return ""
+        try:
+            return str(int(v))  # avoid '543693.0'
+        except Exception:
+            return str(v).strip()
+
     rows: List[Dict] = []
     for _, r in df.iterrows():
-        slug = ("" if pd.isna(r.get("screener_slug")) else str(r.get("screener_slug")).strip())
-        code = ("" if pd.isna(r.get("bse_code")) else str(r.get("bse_code")).strip())
-        rows.append({"name": r["name"], "slug_or_code": slug or code})
-    return rows
+        name = str(r["Company"]).strip()
+        bse_code = to_code(r["BSE_Code"])
+        bse_sym  = str(r.get("BSE_Symbol", "")).strip()
+        nse_sym  = str(r.get("NSE_Symbol", "")).replace(".NS", "").strip()
 
+        # Prefer numeric BSE code (works reliably on Screener),
+        # else fall back to NSE symbol (without .NS), then BSE symbol.
+        slug_or_code = bse_code or nse_sym or bse_sym
+        rows.append({"name": name, "slug_or_code": slug_or_code})
+
+    return rows
 
 def call_llm_for_batch(client: OpenAI, batch_id: int, companies: List[Dict]):
     # We still call it “batch” for compatibility, but we pass ALL companies
