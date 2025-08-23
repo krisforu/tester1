@@ -20,6 +20,7 @@ jobs:
       REQUEST_TIMEOUT: "90"
       SDK_MAX_RETRIES: "2"
       TEST_LIMIT: ${{ inputs.TEST_LIMIT }}
+      STOP_IF_EMPTY: "1" 
 
     steps:
       - name: Checkout repo
