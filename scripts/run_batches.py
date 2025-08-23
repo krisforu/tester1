@@ -1,4 +1,5 @@
 # scripts/run_batches.py
+import os
 import json
 import pathlib
 from typing import List, Dict
