@@ -1,4 +1,4 @@
-name: Screener Prompt Batches (5 at a time)
+name: Screener Prompt (all companies)
 
 on:
   workflow_dispatch:
@@ -10,18 +10,50 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt  # enable pip cache to speed up installs
+          # setup-python has built-in dependency caching for pip. :contentReference[oaicite:0]{index=0}
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install openai pandas
-      - name: Run prompt batches
+          pip install -r requirements.txt
+          # requirements.txt should include: openai, pandas[html], openpyxl, tqdm, tenacity, etc.
+          # pandas[html] installs bs4 + lxml/html5lib used by read_html. :contentReference[oaicite:1]{index=1}
+
+      - name: Ensure companies.csv exists (convert from Excel if needed)
         run: |
-          python scripts/run_batches.py
+          python - <<'PY'
+          import os, pandas as pd
+          if not os.path.exists("data/companies.csv"):
+              src = "data/companies.xlsx" if os.path.exists("data/companies.xlsx") else "data/companies10.xlsx"
+              df = pd.read_excel(src)  # needs openpyxl, which we installed
+              # ensure headers: name, screener_slug, bse_code (rename here if your xlsx differs)
+              df.to_csv("data/companies.csv", index=False)
+              print("Wrote data/companies.csv from", src)
+          else:
+              print("Found data/companies.csv")
+          PY
+        # pandas.read_excel supports .xlsx via the openpyxl engine once installed. :contentReference[oaicite:2]{index=2}
+
+      - name: Run prompt (all companies at once)
+        run: |
+          python scripts/run_all.py
+        # scripts/run_all.py sends ONE Responses API request with web_search + code_interpreter
+        # and downloads the generated PDF/CSV into build/.
+
+      - name: List build outputs (debug)
+        run: ls -la build
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: screener-batch-report
-          path: build/**
+          name: screener-report
+          path: |
+            build/AllCompanies_Report.pdf
+            build/AllCompanies_Quarterly.csv
+        # upload-artifact v4 uploads files/dirs you specify; wildcards are supported. :contentReference[oaicite:3]{index=3}
