@@ -1,56 +1,61 @@
-name: Screener Prompt (Charts & CSV)
+name: Screener Prompt (web_search → JSON → local charts)
 
 on:
   workflow_dispatch:
     inputs:
       TEST_LIMIT:
+        description: "Trim companies list to first N rows (0 = no trim)"
+        required: false
+        default: "0"
         type: number
-        description: "Trim companies.xlsx to first N rows (0 = all)"
-        default: 0
 
 jobs:
-  screener:
-    name: Generate Equity Report
+  build:
     runs-on: ubuntu-latest
-
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      # Model & batching
       RESP_MODEL: gpt-5
-      BATCH_SIZE: "20"
-      REQUEST_TIMEOUT: "90"
-      SDK_MAX_RETRIES: "2"
-      TEST_LIMIT: ${{ inputs.TEST_LIMIT }}
-      STOP_IF_EMPTY: "1" 
+      BATCH_SIZE: "10"              # smaller while stabilising; raise later
+
+      # Client/network robustness
+      REQUEST_TIMEOUT: "120"
+      SDK_MAX_RETRIES: "3"
+      MAX_LLM_RETRIES: "3"
+      RETRY_BACKOFF_BASE: "2.0"
+
+      # Behaviour toggles
+      STOP_IF_EMPTY: "1"            # stop after first empty batch (after writing a placeholder PDF)
+      USE_WEB_SEARCH: "1"           # set to "0" to disable tool (faster/cheaper; may reduce accuracy)
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ── Optional tester: trim input to N companies to save cost ─────────────
       - name: Apply TEST_LIMIT (cost-saver)
-        if: ${{ inputs.TEST_LIMIT != 0 }}
+        if: ${{ inputs.TEST_LIMIT && inputs.TEST_LIMIT > 0 }}
         run: |
           python - <<'PY'
           import os, pandas as pd
-          n = int(os.getenv("TEST_LIMIT", "0"))
-          for path in ("data/companies.xlsx", "data/companies10.xlsx"):
-              if os.path.exists(path):
-                  df = pd.read_excel(path)
-                  df.head(n).to_excel(path, index=False)
-                  print(f"Trimmed {path} to {n} rows.")
-                  break
-          else:
-              print("No companies.xlsx/companies10.xlsx found.")
+          n = int(os.getenv("TEST_LIMIT","0"))
+          for path in ("data/companies.xlsx","data/companies10.xlsx","data/companies.csv"):
+            if os.path.exists(path):
+              df = pd.read_excel(path) if path.endswith(".xlsx") else pd.read_csv(path)
+              df.head(n).to_excel(path, index=False) if path.endswith(".xlsx") else df.head(n).to_csv(path, index=False)
+              print(f"Trimmed {path} to first {n} rows")
+              break
           PY
 
       - name: Run Python batches
@@ -58,11 +63,8 @@ jobs:
 
       - name: List build outputs (debug)
         run: |
-          echo "Repo root:"
-          ls -la
-          echo "Build dir:"
-          ls -la build || true
-
+          echo "Repo root:"; ls -la
+          echo "Build dir:"; ls -la build || true
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
