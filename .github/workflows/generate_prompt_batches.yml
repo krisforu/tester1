@@ -8,7 +8,6 @@ on:
         required: false
         default: "0"
         type: number  # This ensures a numeric input field appears
-
 jobs:
   build:
     runs-on: ubuntu-latest
