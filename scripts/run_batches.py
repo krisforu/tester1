@@ -71,21 +71,22 @@ def call_llm_for_batch(client, batch_id: int, companies: List[Dict]):
         saved.append(out_path)
     return saved
 
-def main():
-    client = OpenAI()  # requires OPENAI_API_KEY in env
-    companies = load_companies()
-    all_pdfs = []
-    for batch_id, batch in chunker(companies, BATCH_SIZE):
-        saved = call_llm_for_batch(client, batch_id, batch)
-        print(f"[batch {batch_id}] saved:", [str(p) for p in saved])
-        # collect PDFs for final merge
-        for p in saved:
-            if p.suffix.lower() == ".pdf":
-                all_pdfs.append(str(p))
+ def main():
+     client = OpenAI()  # requires OPENAI_API_KEY in env
+     companies = load_companies()
+-    all_pdfs = []
+-    for batch_id, batch in chunker(companies, BATCH_SIZE):
+-        saved = call_llm_for_batch(client, batch_id, batch)
+-        print(f"[batch {batch_id}] saved:", [str(p) for p in saved])
+-        for p in saved:
+-            if p.suffix.lower() == ".pdf":
+-                all_pdfs.append(str(p))
++    saved = call_llm_for_batch(client, 1, companies)
++    print(f"[all] saved:", [str(p) for p in saved])
 
-    print("\nArtifacts in build/:")
-    for p in sorted(OUTDIR.glob("*")):
-        print(" -", p)
+     print("\nArtifacts in build/:")
+     for p in sorted(OUTDIR.glob("*")):
+         print(" -", p)
 
 if __name__ == "__main__":
     main()
