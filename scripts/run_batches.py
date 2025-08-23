@@ -7,7 +7,7 @@ from typing import List, Dict
 import pandas as pd
 from openai import OpenAI
 
-MODEL = "o1-mini"  # Responses API model
+MODEL = "gpt-4o"  # Responses API model
 OUTDIR = pathlib.Path("build")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
