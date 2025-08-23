@@ -56,8 +56,13 @@ jobs:
       - name: Run Python batches
         run: python scripts/run_batches.py
 
-      - name: Show build outputs
-        run: ls -R build || true
+      - name: List build outputs (debug)
+        run: |
+          echo "Repo root:"
+          ls -la
+          echo "Build dir:"
+          ls -la build || true
+
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
