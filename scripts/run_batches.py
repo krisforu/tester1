@@ -238,31 +238,32 @@ def main():
         batch_list = data.get("companies", [])
         print(f"   received {len(batch_list)} company payloads")
 
-        # if nothing came back → fail-fast (configurable)
-        if not batch_list and STOP_IF_EMPTY:
-            print("Empty batch result. Stopping to avoid further charges.")
-            break
-
+        # Tidy (works even if batch_list is empty)
         qdf_b, sdf_b = tidy_to_frames(batch_list)
 
-        # Append CSV now
+        # Always write a batch PDF so build/ has content
+        # (names will be [], so the placeholder “Batch X: no data.” page is created)
+        names_q = qdf_b["company"] if "company" in qdf_b else pd.Series(dtype=str)
+        names_s = sdf_b["company"] if "company" in sdf_b else pd.Series(dtype=str)
+        names = sorted(set(pd.concat([names_q, names_s], ignore_index=True).dropna()))
+        pdf_path = write_batch_pdf(bid, names, qdf_b, sdf_b)
+        batch_pdfs.append(pdf_path)
+        print(f"✓ Batch {bid} PDF:", pdf_path)
+
+        # Append CSV (safe even when empty; produces headers once if file absent)
         try:
             append_batch_csv(qdf_b, sdf_b)
         except Exception as ex:
             print(f"WARN: CSV append failed for batch {bid}: {ex}")
 
-        # Names for this batch’s PDF
-        names_q = qdf_b["company"] if "company" in qdf_b else pd.Series(dtype=str)
-        names_s = sdf_b["company"] if "company" in sdf_b else pd.Series(dtype=str)
-        names = sorted(set(pd.concat([names_q, names_s], ignore_index=True).dropna()))
-
-        pdf_path = write_batch_pdf(bid, names, qdf_b, sdf_b)
-        batch_pdfs.append(pdf_path)
-        print(f"✓ Batch {bid} PDF:", pdf_path)
+        # If empty and configured to stop, now we have a PDF in build/; stop here
+        if not batch_list and STOP_IF_EMPTY:
+            print("Empty batch result. Stopping to avoid further charges.")
+            break
 
         time.sleep(1)  # gentle pacing
 
-    # Try merging per-batch PDFs
+    # Try merging individual batch PDFs (optional)
     try:
         merge_all_pdfs(batch_pdfs, MASTER_PDF)
     except Exception as ex:
@@ -271,6 +272,7 @@ def main():
     print("\nArtifacts in build/:")
     for p in sorted(OUTDIR.glob("*")):
         print(" -", p)
+
 
 if __name__ == "__main__":
     main()
