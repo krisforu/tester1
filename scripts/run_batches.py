@@ -1,13 +1,9 @@
 # scripts/run_batches.py
-import os
-import json
-import time
-import pathlib
+import os, re, json, time, pathlib
 from typing import List, Dict, Any
-
 import pandas as pd
 
-# Headless plotting for CI
+# Headless plotting
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -16,30 +12,22 @@ from matplotlib.backends.backend_pdf import PdfPages
 from openai import OpenAI
 from openai import APIStatusError
 
-# Optional: PDF merge at the end (graceful if missing)
 try:
     from pypdf import PdfMerger
     HAVE_PYPDF = True
 except Exception:
     HAVE_PYPDF = False
 
-# =======================
-# Config (via env vars)
-# =======================
 MODEL = os.getenv("RESP_MODEL", "gpt-5")
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))          # 20 per your request
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60"))
-SDK_MAX_RETRIES = int(os.getenv("SDK_MAX_RETRIES", "0"))  # <-- no SDK retries to avoid extra spend
+SDK_MAX_RETRIES = int(os.getenv("SDK_MAX_RETRIES", "0"))  # no SDK retries to avoid extra spend
+STOP_IF_EMPTY = os.getenv("STOP_IF_EMPTY", "1") not in ("0", "false", "False")
 
-OUTDIR = pathlib.Path("build")
-OUTDIR.mkdir(parents=True, exist_ok=True)
-
+OUTDIR = pathlib.Path("build"); OUTDIR.mkdir(parents=True, exist_ok=True)
 MASTER_CSV = OUTDIR / "AllCompanies_Quarterly.csv"
 MASTER_PDF = OUTDIR / "AllCompanies_Report.pdf"
 
-# =======================
-# Excel helpers
-# =======================
 def _pick(df: pd.DataFrame, *candidates: str) -> str | None:
     low = {str(c).strip().lower(): c for c in df.columns}
     for n in candidates:
@@ -49,8 +37,7 @@ def _pick(df: pd.DataFrame, *candidates: str) -> str | None:
 
 def _find_excel() -> str:
     for p in ("data/companies.xlsx", "data/companies10.xlsx"):
-        if os.path.exists(p):
-            return p
+        if os.path.exists(p): return p
     raise FileNotFoundError("Expected data/companies.xlsx (or data/companies10.xlsx).")
 
 def _clean_bse_code(v) -> str:
@@ -63,21 +50,19 @@ def load_companies_xlsx() -> List[Dict[str, str]]:
     path = _find_excel()
     df = pd.read_excel(path)
     df.columns = [str(c).strip() for c in df.columns]
-
     c_name = _pick(df, "Company", "Name", "Company Name")
     c_nse  = _pick(df, "NSE_Symbol", "NSE Symbol", "NSE")
     c_bses = _pick(df, "BSE_Symbol", "BSE Symbol", "BSE")
     c_bsec = _pick(df, "BSE_Code", "BSE Code", "Code")
     if not c_name:
         raise ValueError("Excel must contain a company name column (e.g., 'Company').")
-
     rows: List[Dict[str, str]] = []
     for _, r in df.iterrows():
         rows.append({
             "name": str(r[c_name]).strip(),
-            "nse_symbol": "" if not c_nse  or pd.isna(r.get(c_nse))  else str(r[c_nse]).strip(),
+            "nse_symbol": "" if not c_nse or pd.isna(r.get(c_nse)) else str(r[c_nse]).strip(),
             "bse_symbol": "" if not c_bses or pd.isna(r.get(c_bses)) else str(r[c_bses]).strip(),
-            "bse_code":   "" if not c_bsec or pd.isna(r.get(c_bsec)) else _clean_bse_code(r[c_bsec]),
+            "bse_code": "" if not c_bsec or pd.isna(r.get(c_bsec)) else _clean_bse_code(r[c_bsec]),
         })
     return rows
 
@@ -85,82 +70,100 @@ def chunk(lst: List[Dict[str, str]], size: int):
     for i in range(0, len(lst), size):
         yield (i // size) + 1, lst[i:i+size]
 
-# =======================
-# LLM call – single attempt, fail-fast on quota
-# =======================
-def call_web_only_json(client: OpenAI, group: List[Dict[str, str]]) -> Dict[str, Any]:
-    """One attempt only; any 'insufficient_quota' stops the whole run."""
-    prompt = open("prompts/PROMPT.md", "r", encoding="utf-8").read()
-    payload = {"companies": group, "want_quarters": "all"}
+# ---------- LLM call with JSON hardening ----------
+def _json_hard_prompt(companies: List[Dict[str, str]]) -> str:
+    return (
+        "You are a data extraction worker. Using Screener.in where possible, return ONLY valid JSON.\n"
+        "Do not add any prose or markdown, just JSON.\n"
+        "Schema:\n"
+        "{\n"
+        '  "companies": [\n'
+        "    {\n"
+        '      "name": "<resolved company name>",\n'
+        '      "resolved": true | false,\n'
+        '      "quarters": [ {"q": "Jun 2022", "sales_cr": 0.0, "net_profit_cr": 0.0}, ... ],\n'
+        '      "shareholding": [ {"q": "Jun 2022", "promoters_pct": 0.0, "fii_pct": 0.0, "dii_pct": 0.0, "public_pct": 0.0, "others_pct": 0.0}, ... ]\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Companies batch (use name → NSE → BSE symbol → BSE code priority to locate pages):\n"
+        + json.dumps(companies, ensure_ascii=False)
+    )
 
+def _extract_json(text: str) -> Dict[str, Any]:
+    # Try direct parse first
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict): return obj
+    except Exception:
+        pass
+    # Salvage JSON from text by grabbing the outermost braces
+    m1 = text.find("{"); m2 = text.rfind("}")
+    if m1 != -1 and m2 != -1 and m2 > m1:
+        snip = text[m1:m2+1]
+        try:
+            obj = json.loads(snip)
+            if isinstance(obj, dict): return obj
+        except Exception:
+            pass
+    return {"companies": []}
+
+def call_web_only_json(client: OpenAI, batch_id: int, group: List[Dict[str, str]]) -> Dict[str, Any]:
+    prompt = _json_hard_prompt(group)
     try:
         resp = client.responses.create(
             model=MODEL,
+            # web_search helps; if your plan blocks it, the model will still answer from knowledge.
             tools=[{"type": "web_search"}],
-            input=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": json.dumps(payload)},
-            ],
+            input=[{"role": "user", "content": prompt}],
         )
     except APIStatusError as e:
-        # 429 hits with type='insufficient_quota' when account is out of credit
         msg = getattr(e, "message", "") or str(e)
-        err_type = getattr(getattr(e, "body", {}), "get", lambda *_: None)("type")
-        err_code = getattr(getattr(e, "body", {}), "get", lambda *_: None)("code")
-        if "insufficient_quota" in msg or err_type == "insufficient_quota" or err_code == "insufficient_quota":
+        err = getattr(e, "body", {}) or {}
+        if "insufficient_quota" in msg or err.get("type") == "insufficient_quota" or err.get("code") == "insufficient_quota":
             raise RuntimeError("INSUFFICIENT_QUOTA") from e
-        # Other API errors → just return empty for this batch
         print("API error (non-quota):", msg)
         return {"companies": []}
     except Exception as e:
         print("LLM call failed:", e)
         return {"companies": []}
 
-    text = getattr(resp, "output_text", "") or "{}"
+    text = getattr(resp, "output_text", "") or ""
+    # Save raw reply for cheap debugging
+    raw_path = OUTDIR / f"raw_batch_{batch_id:02d}.txt"
     try:
-        return json.loads(text)
-    except Exception as e:
-        print("WARN: JSON parse failed:", e)
-        print("RAW TEXT (first 1k):", text[:1000])
-        return {"companies": []}
+        raw_path.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
 
-# =======================
-# Tidy into DataFrames (safe when empty)
-# =======================
+    obj = _extract_json(text)
+    # Sanity: must have "companies" list
+    if not isinstance(obj, dict) or not isinstance(obj.get("companies"), list):
+        return {"companies": []}
+    return obj
+
+# ---------- Tidy / plotting / I/O ----------
 def tidy_to_frames(collected: List[Dict[str, Any]]):
     q_rows, s_rows = [], []
     for c in collected:
         name = c.get("name", "")
-        if not c.get("resolved", False):
+        if not c.get("resolved", False):  # ignore unresolved
             continue
         for row in (c.get("quarters") or []):
-            q_rows.append({
-                "company": name,
-                "quarter": row.get("q", ""),
-                "sales_cr": row.get("sales_cr", None),
-                "net_profit_cr": row.get("net_profit_cr", None),
-            })
+            q_rows.append({"company": name, "quarter": row.get("q",""),
+                           "sales_cr": row.get("sales_cr"), "net_profit_cr": row.get("net_profit_cr")})
         for row in (c.get("shareholding") or []):
-            s_rows.append({
-                "company": name,
-                "quarter": row.get("q", ""),
-                "promoters_pct": row.get("promoters_pct", None),
-                "fii_pct": row.get("fii_pct", None),
-                "dii_pct": row.get("dii_pct", None),
-                "public_pct": row.get("public_pct", None),
-                "others_pct": row.get("others_pct", None),
-            })
-    qdf = pd.DataFrame(q_rows, columns=["company", "quarter", "sales_cr", "net_profit_cr"])
-    sdf = pd.DataFrame(s_rows, columns=["company", "quarter", "promoters_pct", "fii_pct", "dii_pct", "public_pct", "others_pct"])
+            s_rows.append({"company": name, "quarter": row.get("q",""),
+                           "promoters_pct": row.get("promoters_pct"), "fii_pct": row.get("fii_pct"),
+                           "dii_pct": row.get("dii_pct"), "public_pct": row.get("public_pct"),
+                           "others_pct": row.get("others_pct")})
+    qdf = pd.DataFrame(q_rows, columns=["company","quarter","sales_cr","net_profit_cr"])
+    sdf = pd.DataFrame(s_rows, columns=["company","quarter","promoters_pct","fii_pct","dii_pct","public_pct","others_pct"])
     return qdf, sdf
 
-# =======================
-# Plotting + outputs
-# =======================
 def plot_company(pdf: PdfPages, name: str, qdf: pd.DataFrame, sdf: pd.DataFrame):
-    # Page 1: Sales & Net Profit
-    plt.figure(figsize=(10, 5))
-    sub = qdf[qdf["company"] == name].sort_values("quarter")
+    plt.figure(figsize=(10,5))
+    sub = qdf[qdf["company"]==name].sort_values("quarter")
     if sub.empty:
         plt.title(f"{name} — Sales & Net Profit (no data)")
     else:
@@ -171,15 +174,14 @@ def plot_company(pdf: PdfPages, name: str, qdf: pd.DataFrame, sdf: pd.DataFrame)
         plt.legend(); plt.tight_layout()
     pdf.savefig(); plt.close()
 
-    # Page 2: Shareholding %
-    plt.figure(figsize=(10, 5))
-    sub = sdf[sdf["company"] == name].sort_values("quarter")
+    plt.figure(figsize=(10,5))
+    sub = sdf[sdf["company"]==name].sort_values("quarter")
     if sub.empty:
         plt.title(f"{name} — Shareholding % (no data)")
     else:
-        for col in ["promoters_pct", "fii_pct", "dii_pct", "public_pct", "others_pct"]:
+        for col in ["promoters_pct","fii_pct","dii_pct","public_pct","others_pct"]:
             if col in sub and sub[col].notna().any():
-                plt.plot(sub["quarter"], sub[col], label=col.replace("_", " ").title())
+                plt.plot(sub["quarter"], sub[col], label=col.replace("_"," ").title())
         plt.title(f"{name} — Shareholding %")
         plt.xticks(rotation=45, ha="right"); plt.xlabel("Quarter"); plt.ylabel("%")
         plt.legend(); plt.tight_layout()
@@ -189,8 +191,8 @@ def write_batch_pdf(batch_id: int, names: List[str], qdf: pd.DataFrame, sdf: pd.
     out_pdf = OUTDIR / f"Report_batch_{batch_id:02d}.pdf"
     with PdfPages(out_pdf) as pdf:
         if not names:
-            plt.figure(figsize=(8, 4)); plt.axis("off")
-            plt.text(0.5, 0.5, f"Batch {batch_id}: no data.", ha="center", va="center", fontsize=12)
+            plt.figure(figsize=(8,4)); plt.axis("off")
+            plt.text(0.5,0.5,f"Batch {batch_id}: no data.", ha="center", va="center", fontsize=12)
             pdf.savefig(); plt.close()
         else:
             for name in names:
@@ -198,13 +200,13 @@ def write_batch_pdf(batch_id: int, names: List[str], qdf: pd.DataFrame, sdf: pd.
     return out_pdf
 
 def append_batch_csv(qdf: pd.DataFrame, sdf: pd.DataFrame):
-    merged = pd.merge(qdf, sdf, on=["company", "quarter"], how="outer").sort_values(["company", "quarter"])
+    merged = pd.merge(qdf, sdf, on=["company","quarter"], how="outer").sort_values(["company","quarter"])
     mode = "a" if MASTER_CSV.exists() else "w"
     merged.to_csv(MASTER_CSV, index=False, encoding="utf-8", mode=mode, header=(mode=="w"))
 
 def merge_all_pdfs(batch_pdfs: List[pathlib.Path], out_path: pathlib.Path):
     if not HAVE_PYPDF:
-        print("pypdf not installed; skipping final PDF merge. Keeping per-batch PDFs.")
+        print("pypdf not installed; skipping final PDF merge.")
         return
     merger = PdfMerger()
     for p in batch_pdfs:
@@ -217,19 +219,16 @@ def merge_all_pdfs(batch_pdfs: List[pathlib.Path], out_path: pathlib.Path):
     merger.close()
     print("✓ Merged PDF:", out_path)
 
-# =======================
-# Main
-# =======================
+# ---------- Main ----------
 def main():
     client = OpenAI(timeout=REQUEST_TIMEOUT, max_retries=SDK_MAX_RETRIES)
     companies = load_companies_xlsx()
 
     batch_pdfs: List[pathlib.Path] = []
-
     for bid, group in chunk(companies, BATCH_SIZE):
         print(f"-- Batch {bid} ({len(group)} companies) --")
         try:
-            data = call_web_only_json(client, group)
+            data = call_web_only_json(client, bid, group)
         except RuntimeError as e:
             if str(e) == "INSUFFICIENT_QUOTA":
                 print("Detected insufficient_quota — stopping immediately.")
@@ -239,29 +238,31 @@ def main():
         batch_list = data.get("companies", [])
         print(f"   received {len(batch_list)} company payloads")
 
-        # Tidy ONLY this batch
+        # if nothing came back → fail-fast (configurable)
+        if not batch_list and STOP_IF_EMPTY:
+            print("Empty batch result. Stopping to avoid further charges.")
+            break
+
         qdf_b, sdf_b = tidy_to_frames(batch_list)
 
-        # Append CSV immediately (checkpoint)
+        # Append CSV now
         try:
             append_batch_csv(qdf_b, sdf_b)
         except Exception as ex:
             print(f"WARN: CSV append failed for batch {bid}: {ex}")
 
-        # Companies present in this batch for the PDF
+        # Names for this batch’s PDF
         names_q = qdf_b["company"] if "company" in qdf_b else pd.Series(dtype=str)
         names_s = sdf_b["company"] if "company" in sdf_b else pd.Series(dtype=str)
         names = sorted(set(pd.concat([names_q, names_s], ignore_index=True).dropna()))
 
-        # Write the batch PDF now (checkpoint)
         pdf_path = write_batch_pdf(bid, names, qdf_b, sdf_b)
         batch_pdfs.append(pdf_path)
         print(f"✓ Batch {bid} PDF:", pdf_path)
 
-        # Gentle pacing to avoid spiking TPM
-        time.sleep(1)
+        time.sleep(1)  # gentle pacing
 
-    # Optional final merge
+    # Try merging per-batch PDFs
     try:
         merge_all_pdfs(batch_pdfs, MASTER_PDF)
     except Exception as ex:
