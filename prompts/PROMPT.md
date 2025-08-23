@@ -19,3 +19,14 @@ Implementation rules:
     align/clean the last 13 quarters, draw charts, and write the PDF/CSV.
   - Be polite to the site (don’t hammer it) and handle missing values.
 Return: the generated PDF file and CSV file as outputs.
+
+Output rules (IMPORTANT):
+
+- Use Python in Code Interpreter to generate TWO files and save them with EXACT names:
+  • AllCompanies_Report.pdf
+  • AllCompanies_Quarterly.csv
+
+- After saving, ATTACH both files to your final message so they appear as downloadable files
+  (do not paste CSV inline; return them as files).
+
+- If a table is missing for a company, still create the files and mark that company as "missing".
