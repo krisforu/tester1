@@ -87,11 +87,9 @@ def call_web_only_json(client: OpenAI, group: List[Dict[str, str]]) -> Dict[str,
     prompt = open("prompts/PROMPT.md", "r", encoding="utf-8").read()
     payload = {"companies": group, "want_quarters": "all"}
 
-    # Responses API: use text_format (response_format is for Chat Completions)
     resp = client.responses.create(
         model=MODEL,
         tools=[{"type": "web_search"}],
-        text_format={"type": "json"},  # ask the model to return one JSON object
         input=[
             {"role": "system", "content": prompt},
             {"role": "user",   "content": json.dumps(payload)}
