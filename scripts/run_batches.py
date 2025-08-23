@@ -24,16 +24,26 @@ from tenacity import (
 from openai import OpenAI
 from openai import APIConnectionError, APIStatusError, RateLimitError
 
+# Optional: PDF merge at the end (graceful if missing)
+try:
+    from pypdf import PdfMerger
+    HAVE_PYPDF = True
+except Exception:
+    HAVE_PYPDF = False
+
 # =======================
 # Config (via env vars)
 # =======================
 MODEL = os.getenv("RESP_MODEL", "gpt-5")
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))          # modest default to reduce retries
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))         # 20 per your request
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "90"))
 SDK_MAX_RETRIES = int(os.getenv("SDK_MAX_RETRIES", "2"))  # short SDK retries
 
 OUTDIR = pathlib.Path("build")
 OUTDIR.mkdir(parents=True, exist_ok=True)
+
+MASTER_CSV = OUTDIR / "AllCompanies_Quarterly.csv"
+MASTER_PDF = OUTDIR / "AllCompanies_Report.pdf"
 
 
 # =======================
@@ -69,7 +79,6 @@ def load_companies_xlsx() -> List[Dict[str, str]]:
     """
     Reads a wide Excel and returns rows with:
       {name, nse_symbol, bse_symbol, bse_code}
-    The prompt will try Company → NSE → BSE Symbol → BSE Code.
     """
     path = _find_excel()
     df = pd.read_excel(path)
@@ -210,7 +219,7 @@ def tidy_to_frames(collected: List[Dict[str, Any]]):
 
 
 # =======================
-# Plotting
+# Plotting helpers
 # =======================
 def plot_company(pdf: PdfPages, name: str, qdf: pd.DataFrame, sdf: pd.DataFrame):
     # Page 1: Sales & Net Profit
@@ -249,70 +258,105 @@ def plot_company(pdf: PdfPages, name: str, qdf: pd.DataFrame, sdf: pd.DataFrame)
     plt.close()
 
 
+def write_batch_pdf(batch_id: int, companies_names: List[str], qdf: pd.DataFrame, sdf: pd.DataFrame) -> pathlib.Path:
+    out_pdf = OUTDIR / f"Report_batch_{batch_id:02d}.pdf"
+    with PdfPages(out_pdf) as pdf:
+        if not companies_names:
+            plt.figure(figsize=(8, 4))
+            plt.axis("off")
+            plt.text(0.5, 0.5, f"Batch {batch_id}: no data.", ha="center", va="center", fontsize=12)
+            pdf.savefig()
+            plt.close()
+        else:
+            for name in companies_names:
+                plot_company(pdf, name, qdf, sdf)
+    return out_pdf
+
+
+def append_batch_csv(qdf: pd.DataFrame, sdf: pd.DataFrame, header_written: bool) -> bool:
+    """Append this batch's data to the master CSV (outer-join)"""
+    merged = pd.merge(qdf, sdf, on=["company", "quarter"], how="outer").sort_values(
+        ["company", "quarter"]
+    )
+    mode = "a" if MASTER_CSV.exists() or header_written else "w"
+    write_header = (mode == "w")
+    merged.to_csv(MASTER_CSV, index=False, encoding="utf-8", mode=mode, header=write_header)
+    return True
+
+
+def merge_all_pdfs(batch_pdfs: List[pathlib.Path], out_path: pathlib.Path):
+    if not HAVE_PYPDF:
+        print("pypdf not installed; skipping final PDF merge. Keeping per-batch PDFs.")
+        return
+    merger = PdfMerger()
+    for p in batch_pdfs:
+        if p.exists() and p.stat().st_size > 0:
+            merger.append(str(p))
+    if len(merger.pages) == 0:
+        print("No pages to merge.")
+        return
+    with open(out_path, "wb") as f:
+        merger.write(f)
+    merger.close()
+    print("✓ Merged PDF:", out_path)
+
+
 # =======================
 # Main
 # =======================
 def main():
-    # OpenAI client with longer timeout and short SDK retries
     client = OpenAI(timeout=REQUEST_TIMEOUT, max_retries=SDK_MAX_RETRIES)
 
     companies = load_companies_xlsx()
-    all_companies_payload: List[Dict[str, Any]] = []
+
+    header_written = False  # for CSV header control
+    batch_pdfs: List[pathlib.Path] = []
 
     for bid, group in chunk(companies, BATCH_SIZE):
         print(f"-- Batch {bid} ({len(group)} companies) --")
         try:
             data = call_web_only_json(client, group)
         except Exception as e:
+            msg = str(e).lower()
             print(f"ERROR: batch {bid} failed after retries: {e}")
+            # Stop early if this is hard quota exhaustion
+            if "insufficient_quota" in msg:
+                print("Detected insufficient_quota; stopping further batches.")
+                break
+            # else continue to next batch
             data = {"companies": []}
 
         batch_list = data.get("companies", [])
         print(f"   received {len(batch_list)} company payloads")
-        all_companies_payload.extend(batch_list)
+
+        # Tidy frames for ONLY this batch
+        qdf_b, sdf_b = tidy_to_frames(batch_list)
+
+        # Append to master CSV immediately
+        try:
+            append_batch_csv(qdf_b, sdf_b, header_written)
+            header_written = True
+        except Exception as ex:
+            print(f"WARN: Could not append CSV for batch {bid}: {ex}")
+
+        # Prepare company names for this batch's PDF
+        names_q = qdf_b["company"] if "company" in qdf_b else pd.Series(dtype=str)
+        names_s = sdf_b["company"] if "company" in sdf_b else pd.Series(dtype=str)
+        companies_for_pdf = sorted(set(pd.concat([names_q, names_s], ignore_index=True).dropna()))
+
+        # Write a PDF per batch right away
+        pdf_path = write_batch_pdf(bid, companies_for_pdf, qdf_b, sdf_b)
+        batch_pdfs.append(pdf_path)
+        print(f"✓ Batch {bid} PDF:", pdf_path)
 
         # Gentle pacing between batches (helps with TPM)
         time.sleep(2)
 
-    # Tidy → DataFrames
-    qdf, sdf = tidy_to_frames(all_companies_payload)
-
-    # Combined CSV (quarterly + shareholding)
-    out_csv = OUTDIR / "AllCompanies_Quarterly.csv"
-    merged = pd.merge(qdf, sdf, on=["company", "quarter"], how="outer").sort_values(
-        ["company", "quarter"]
-    )
-    merged.to_csv(out_csv, index=False, encoding="utf-8")
-    print("✓ CSV:", out_csv)
-
-    # Multi-page PDF
-    out_pdf = OUTDIR / "AllCompanies_Report.pdf"
-    with PdfPages(out_pdf) as pdf:
-        # Derive the set of companies to plot from either df
-        names_q = qdf["company"] if "company" in qdf else pd.Series(dtype=str)
-        names_s = sdf["company"] if "company" in sdf else pd.Series(dtype=str)
-        companies_for_pdf = sorted(
-            set(pd.concat([names_q, names_s], ignore_index=True).dropna())
-        )
-
-        if not companies_for_pdf:
-            plt.figure(figsize=(8, 4))
-            plt.axis("off")
-            plt.text(
-                0.5,
-                0.5,
-                "No data returned (network, rate limit, or source issue).",
-                ha="center",
-                va="center",
-                fontsize=12,
-            )
-            pdf.savefig()
-            plt.close()
-        else:
-            for name in companies_for_pdf:
-                plot_company(pdf, name, qdf, sdf)
-
-    print("✓ PDF:", out_pdf)
+    # Try merging all batch PDFs to a single master (optional)
+    try:
+        merge_all_pdfs(batch_pdfs, MASTER_PDF)
+    except Exception as ex:
+        print(f"WARN: Failed to merge PDFs: {ex}")
 
     print("\nArtifacts in build/:")
     for p in sorted(OUTDIR.glob("*")):
