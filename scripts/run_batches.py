@@ -37,7 +37,7 @@ def call_llm_for_batch(client, batch_id: int, companies: List[Dict]):
         # Enable tools: web search + code interpreter (official capability)
         tools=[{"type":"web_search"}, {"type":"code_interpreter"}],  # :contentReference[oaicite:4]{index=4}
         input=[
-            {"role":"system","content": open("PROMPT.md","r",encoding="utf-8").read()},
+            {"role":"system","content": open("prompts/PROMPT.md","r",encoding="utf-8").read()},
             {"role":"user","content": json.dumps(user_payload)}
         ]
     )
