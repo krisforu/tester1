@@ -2,6 +2,10 @@
 import os, json, time, pathlib, math
 from typing import List, Dict, Any
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")   # headless, writes to files
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from openai import OpenAI
